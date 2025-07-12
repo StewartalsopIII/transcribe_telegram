@@ -8,6 +8,13 @@ from telegram.ext import Application, MessageHandler, CommandHandler, ContextTyp
 from pydub import AudioSegment
 import io
 import base64
+import json
+
+# Google AI types for enabling tools like Google Search (may not be strictly required depending on library version)
+try:
+    from google.generativeai import types as genai_types
+except ImportError:
+    genai_types = None
 
 # Load environment variables
 load_dotenv()
@@ -80,9 +87,118 @@ class AudioTranscriber:
         transcription = await self.transcribe_audio(wav_file)
         return transcription
 
+
+class TextProcessor:
+    """Process transcribed text: clarity rewrite, grounding, and proposition extraction."""
+
+    def __init__(self):
+        # Fast / cheap text-only models
+        self.clarity_model = genai.GenerativeModel('gemini-2.5-flash')
+        self.proposition_model = genai.GenerativeModel('gemini-1.5-flash')
+
+    def _enable_google_search_tool(self):
+        """Return a tools argument enabling Google Search grounding if SDK supports it."""
+        # Only enable if the SDK version exposes GoogleSearch and Tool helpers.
+        if genai_types is None:
+            return None
+        if not hasattr(genai_types, "GoogleSearch") or not hasattr(genai_types, "Tool"):
+            return None
+
+        return [genai_types.Tool(google_search=genai_types.GoogleSearch())]
+
+    def rewrite_for_clarity(self, raw_text):
+        """Rewrite the text for clarity and flag ambiguity.
+
+        Returns (clarified_text, ambiguous_terms: list[str])
+        """
+        prompt = (
+            "Rewrite the following text for clarity while preserving meaning.\n"
+            "Surround any word or phrase you suspect was mistranscribed with ‹??›.\n"
+            "After the rewrite, return a JSON object with exactly two keys: \n"
+            "  clarified_text – the rewritten text,\n"
+            "  ambiguous_terms – an array of the flagged words/phrases (may be empty).\n\n"
+            "Text:\n" + raw_text
+        )
+
+        response = self.clarity_model.generate_content(prompt)
+
+        def _extract_json(text: str):
+            """Best-effort extraction of JSON object even if wrapped in code fences."""
+            text = text.strip()
+            # Remove ```json ... ``` fences if present
+            if text.startswith("```"):
+                # Strip leading ```lang and trailing ```
+                lines = text.splitlines()
+                # drop the first line (```json or ```)
+                if lines:
+                    lines = lines[1:]
+                # remove trailing ``` if present
+                if lines and lines[-1].strip().startswith("```"):
+                    lines = lines[:-1]
+                text = "\n".join(lines).strip()
+
+            # Attempt to locate first '{' ... last '}'
+            start = text.find('{')
+            end = text.rfind('}')
+            if start != -1 and end != -1 and end > start:
+                candidate = text[start:end+1]
+                try:
+                    return json.loads(candidate)
+                except json.JSONDecodeError:
+                    pass
+            # Final attempt – direct load
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError:
+                return None
+
+        data = _extract_json(response.text)
+        if data:
+            clarified_text = str(data.get('clarified_text', '')).strip()
+            ambiguous_terms = data.get('ambiguous_terms', []) or []
+            return clarified_text, ambiguous_terms
+
+        # Fallback: treat whole output as clarified text (possible the model didn't output JSON)
+        return response.text.strip(), []
+
+    def ground_ambiguous_terms(self, clarified_text):
+        """Use Google Search grounding to correct ambiguous terms. Returns corrected text."""
+
+        prompt = (
+            "Here is a passage of text. Using web search as needed, correct any words or phrases\n"
+            "that appear between ‹??› markers and return the final corrected text only.\n\n"
+            "Text:\n" + clarified_text
+        )
+
+        tools_arg = self._enable_google_search_tool()
+        if tools_arg is not None:
+            response = self.clarity_model.generate_content(prompt, tools=tools_arg)
+        else:
+            response = self.clarity_model.generate_content(prompt)
+
+        return response.text.strip()
+
+    def extract_propositions(self, final_text):
+        """Split text into atomic propositions and return list[str]."""
+
+        prompt = (
+            "Split the following text into a JSON array named propositions, where each element\n"
+            "is an atomic fact or claim expressed in the text. Return only the JSON.\n\n"
+            "Text:\n" + final_text
+        )
+
+        response = self.proposition_model.generate_content(prompt)
+        try:
+            data = json.loads(response.text)
+            return data.get('propositions', [])
+        except json.JSONDecodeError:
+            # Fallback: split by lines
+            return [line.strip() for line in response.text.splitlines() if line.strip()]
+
 class TelegramBot:
     def __init__(self):
         self.transcriber = AudioTranscriber()
+        self.text_processor = TextProcessor()
         
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /start command."""
@@ -124,10 +240,32 @@ class TelegramBot:
             audio_data = await self.transcriber.download_audio_file(file)
             transcription = await self.transcriber.process_audio(audio_data)
 
-            # Send transcription
-            await update.message.reply_text(
-                f"📝 Transcription and Translation:\n\n{transcription}"
-            )
+            # ---- New post-processing pipeline ----
+            clarified_text, ambiguous_terms = self.text_processor.rewrite_for_clarity(transcription)
+
+            # Ground ambiguous terms if needed
+            if ambiguous_terms:
+                final_text = self.text_processor.ground_ambiguous_terms(clarified_text)
+            else:
+                final_text = clarified_text
+
+            propositions = self.text_processor.extract_propositions(final_text)
+
+            # Compose rich response
+            response_lines = [
+                "📝 Original transcription:", transcription, "",
+                "✏️ Clarified text:", final_text, "",
+            ]
+
+            if ambiguous_terms:
+                response_lines.extend(["🚩 Ambiguous terms:", ", ".join(ambiguous_terms), ""])
+
+            if propositions:
+                response_lines.append("📌 Atomic propositions:")
+                for idx, prop in enumerate(propositions, 1):
+                    response_lines.append(f"{idx}. {prop}")
+
+            await update.message.reply_text("\n".join(response_lines))
 
             # Delete processing message
             await processing_message.delete()
