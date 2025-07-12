@@ -114,6 +114,7 @@ class TextProcessor:
         prompt = (
             "Rewrite the following text for clarity while preserving meaning.\n"
             "Surround any word or phrase you suspect was mistranscribed with ‹??›.\n"
+            "Format the text with proper paragraphs and structure for readability - break up long sentences and add line breaks between different topics or ideas.\n"
             "After the rewrite, return a JSON object with exactly two keys: \n"
             "  clarified_text – the rewritten text,\n"
             "  ambiguous_terms – an array of the flagged words/phrases (may be empty).\n\n"
@@ -251,21 +252,28 @@ class TelegramBot:
 
             propositions = self.text_processor.extract_propositions(final_text)
 
-            # Compose rich response
-            response_lines = [
-                "📝 Original transcription:", transcription, "",
-                "✏️ Clarified text:", final_text, "",
-            ]
+            # -------- Send separate messages --------
 
-            if ambiguous_terms:
-                response_lines.extend(["🚩 Ambiguous terms:", ", ".join(ambiguous_terms), ""])
+            # 1) Original transcription
+            await update.message.reply_text(
+                f"📝 Original transcription:\n\n{transcription}"
+            )
 
-            if propositions:
-                response_lines.append("📌 Atomic propositions:")
-                for idx, prop in enumerate(propositions, 1):
-                    response_lines.append(f"{idx}. {prop}")
+            # 2) Clarified / grounded text
+            await update.message.reply_text(
+                f"✏️ Clarified text:\n\n{final_text}"
+            )
 
-            await update.message.reply_text("\n".join(response_lines))
+            # 3) JSON details (ambiguous terms + propositions)
+            json_payload = json.dumps({
+                "ambiguous_terms": ambiguous_terms,
+                "propositions": propositions,
+            }, ensure_ascii=False, indent=2)
+
+            await update.message.reply_text(
+                f"```json\n{json_payload}\n```",
+                parse_mode="Markdown"
+            )
 
             # Delete processing message
             await processing_message.delete()
