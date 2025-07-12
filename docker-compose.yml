@@ -1,0 +1,10 @@
+version: "3.9"
+
+services:
+  bot:
+    build: .
+    container_name: transcribe-telegram-bot
+    env_file:
+      - .env
+    restart: unless-stopped
+    # No ports exposed – the bot uses outbound long-polling 
