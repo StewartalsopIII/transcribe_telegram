@@ -168,6 +168,7 @@ class TextProcessor:
         prompt = (
             "Here is a passage of text. Using web search as needed, correct any words or phrases\n"
             "that appear between ‹??› markers and return the final corrected text only.\n\n"
+            "Must identify, then qualify all proper-name candidates using web search\n\n"
             "Text:\n" + clarified_text
         )
 
