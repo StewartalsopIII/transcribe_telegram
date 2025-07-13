@@ -163,22 +163,57 @@ class TextProcessor:
         return response.text.strip(), []
 
     def ground_ambiguous_terms(self, clarified_text):
-        """Use Google Search grounding to correct ambiguous terms. Returns corrected text."""
+        """
+        Use Google Search grounding to correct ambiguous terms and qualify proper names.
+
+        Returns (corrected_text: str, search_terms: list[str])
+        """
 
         prompt = (
-            "Here is a passage of text. Using web search as needed, correct any words or phrases\n"
-            "that appear between ‹??› markers and return the final corrected text only.\n\n"
-            "Must identify, then qualify all proper-name candidates using web search\n\n"
+            "Here is a passage of text. Using web search as needed, correct any words or phrases "
+            "that appear between ‹??› markers. Identify and qualify all proper-name candidates "
+            "with web search.\n\n"
+            "Return a JSON object with exactly two keys:\n"
+            "  corrected_text – the final corrected text,\n"
+            "  search_terms   – an array of the search queries you performed (may be empty).\n\n"
             "Text:\n" + clarified_text
         )
 
         tools_arg = self._enable_google_search_tool()
-        if tools_arg is not None:
-            response = self.clarity_model.generate_content(prompt, tools=tools_arg)
-        else:
-            response = self.clarity_model.generate_content(prompt)
+        response = (
+            self.clarity_model.generate_content(prompt, tools=tools_arg)
+            if tools_arg is not None
+            else self.clarity_model.generate_content(prompt)
+        )
 
-        return response.text.strip()
+        # Lightweight helper to pull JSON from model response
+        def _extract_json(text: str):
+            text = text.strip()
+            if text.startswith("```"):
+                lines = text.splitlines()[1:]
+                if lines and lines[-1].strip().startswith("```"):
+                    lines = lines[:-1]
+                text = "\n".join(lines).strip()
+            start, end = text.find("{"), text.rfind("}")
+            if start != -1 and end != -1 and end > start:
+                fragment = text[start : end + 1]
+                try:
+                    return json.loads(fragment)
+                except json.JSONDecodeError:
+                    pass
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError:
+                return None
+
+        data = _extract_json(response.text)
+        if data:
+            corrected_text = str(data.get("corrected_text", "")).strip()
+            search_terms = data.get("search_terms", []) or []
+            return corrected_text, search_terms
+
+        # Fallback – model did not return JSON
+        return response.text.strip(), []
 
     def extract_propositions(self, final_text):
         """Split text into atomic propositions and return list[str]."""
@@ -247,27 +282,25 @@ class TelegramBot:
 
             # Ground ambiguous terms if needed
             if ambiguous_terms:
-                final_text = self.text_processor.ground_ambiguous_terms(clarified_text)
+                final_text, search_terms = self.text_processor.ground_ambiguous_terms(clarified_text)
             else:
                 final_text = clarified_text
+                search_terms = []
 
             propositions = self.text_processor.extract_propositions(final_text)
 
             # -------- Send separate messages --------
 
-            # 1) Original transcription
-            await update.message.reply_text(
-                f"📝 Original transcription:\n\n{transcription}"
-            )
+            # 1) Original transcription (raw, easy to copy)
+            await update.message.reply_text(transcription)
 
-            # 2) Clarified / grounded text
-            await update.message.reply_text(
-                f"✏️ Clarified text:\n\n{final_text}"
-            )
+            # 2) Clarified / grounded text (raw)
+            await update.message.reply_text(final_text)
 
-            # 3) JSON details (ambiguous terms + propositions)
+            # 3) JSON details (ambiguous terms + search terms + propositions)
             json_payload = json.dumps({
                 "ambiguous_terms": ambiguous_terms,
+                "search_terms": search_terms,
                 "propositions": propositions,
             }, ensure_ascii=False, indent=2)
 
