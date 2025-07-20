@@ -9,6 +9,7 @@ from pydub import AudioSegment
 import io
 import base64
 import json
+from typing import Optional
 
 # Google AI types for enabling tools like Google Search (may not be strictly required depending on library version)
 try:
@@ -44,48 +45,72 @@ class AudioTranscriber:
         return wav_io
 
     async def transcribe_audio(self, audio_file):
-        """Transcribe audio and translate to English if not in English."""
+        """Transcribe audio and (if needed) translate to English.
+
+        Returns (original_transcription: str, translation_or_none: Optional[str])
+        """
         try:
-            # Convert the audio file to base64
+            # Convert the audio file to base64 for the inline_data block
             audio_bytes = audio_file.read()
             audio_b64 = base64.b64encode(audio_bytes).decode()
-            
-            # Use the newer Gemini 1.5 Pro model
+
             model = genai.GenerativeModel('gemini-1.5-pro')
-            
-            # Create content parts in the correct format
+
+            prompt = """
+            Transcribe the provided audio and return ONLY a JSON object.
+
+            If the spoken language is English, use this structure:
+            {
+              "is_english": true,
+              "transcription": "Full transcription here."
+            }
+
+            If the spoken language is NOT English, use this structure:
+            {
+              "is_english": false,
+              "original_transcription": "Transcription in the original language.",
+              "english_translation": "High-quality English translation."
+            }
+            """
+
             parts = [
-                {
-                    "inline_data": {
-                        "mime_type": "audio/wav",
-                        "data": audio_b64
-                    }
-                },
-                {
-                    "text": """Please transcribe this audio.
-                    
-                    If the audio is in English:
-                    - Provide ONLY the transcription, nothing else
-                    
-                    If the audio is NOT in English:
-                    Original: [transcription in original language]
-                    Translation: [English translation]"""
-                }
+                {"inline_data": {"mime_type": "audio/wav", "data": audio_b64}},
+                {"text": prompt},
             ]
-            
-            # Generate content with proper format
+
             response = model.generate_content(parts)
-            
-            return response.text
+
+            raw = response.text.strip()
+            # Strip optional ```json fences
+            if raw.startswith("```"):
+                lines = raw.splitlines()
+                # drop first fence line
+                lines = lines[1:]
+                # drop trailing ``` if present
+                if lines and lines[-1].strip().startswith("```"):
+                    lines = lines[:-1]
+                raw = "\n".join(lines).strip()
+
+            try:
+                data = json.loads(raw)
+                if data.get("is_english"):
+                    return data.get("transcription", ""), None
+                else:
+                    return data.get("original_transcription", ""), data.get("english_translation", "")
+            except json.JSONDecodeError as e:
+                logger.error(f"Failed to parse JSON transcription: {e}. Raw response: {raw[:200]}")
+                # Fallback: treat entire response as transcription
+                return raw, None
+
         except Exception as e:
             logger.error(f"Transcription error: {str(e)}")
-            return f"Error transcribing audio: {str(e)}"
+            return f"Error transcribing audio: {str(e)}", None
 
     async def process_audio(self, audio_file):
-        """Process audio file and return transcription."""
+        """Process audio file and return (transcription, optional translation)."""
         wav_file = await self.convert_to_wav(audio_file)
-        transcription = await self.transcribe_audio(wav_file)
-        return transcription
+        transcription, translation = await self.transcribe_audio(wav_file)
+        return transcription, translation
 
 
 class TextProcessor:
@@ -275,10 +300,13 @@ class TelegramBot:
 
             # Download and process audio
             audio_data = await self.transcriber.download_audio_file(file)
-            transcription = await self.transcriber.process_audio(audio_data)
+            transcription, translation = await self.transcriber.process_audio(audio_data)
+
+            # Choose English text (translation if present, else transcription) for downstream NLP steps
+            text_for_processing = translation if translation else transcription
 
             # ---- New post-processing pipeline ----
-            clarified_text, ambiguous_terms = self.text_processor.rewrite_for_clarity(transcription)
+            clarified_text, ambiguous_terms = self.text_processor.rewrite_for_clarity(text_for_processing)
 
             # Ground ambiguous terms if needed
             if ambiguous_terms:
@@ -298,10 +326,14 @@ class TelegramBot:
             # 1) Original transcription (raw, easy to copy)
             await update.message.reply_text(transcription)
 
-            # 2) Clarified / grounded text (raw)
+            # 2) If a separate English translation exists, send it next
+            if translation:
+                await update.message.reply_text(translation)
+
+            # 3) Clarified / grounded English text (raw)
             await update.message.reply_text(final_text)
 
-            # 3) JSON details (ambiguous terms + search terms + propositions)
+            # 4) JSON details (ambiguous terms + search terms + propositions)
             json_payload = json.dumps({
                 "ambiguous_terms": ambiguous_terms,
                 "search_terms": search_terms,
