@@ -289,6 +289,10 @@ class TelegramBot:
 
             propositions = self.text_processor.extract_propositions(final_text)
 
+            # Append the footer to the clarified text before sending
+            if final_text:
+                final_text += "\n\n- This message has been filtered/transcribed by AI while walking"
+
             # -------- Send separate messages --------
 
             # 1) Original transcription (raw, easy to copy)
