@@ -8,6 +8,14 @@ from telegram.ext import Application, MessageHandler, CommandHandler, ContextTyp
 from pydub import AudioSegment
 import io
 import base64
+import json
+from typing import Optional
+
+# Google AI types for enabling tools like Google Search (may not be strictly required depending on library version)
+try:
+    from google.generativeai import types as genai_types
+except ImportError:
+    genai_types = None
 
 # Load environment variables
 load_dotenv()
@@ -37,52 +45,253 @@ class AudioTranscriber:
         return wav_io
 
     async def transcribe_audio(self, audio_file):
-        """Transcribe audio and translate to English if not in English."""
+        """Transcribe audio and (if needed) translate to English.
+
+        Returns (original_transcription: str, translation_or_none: Optional[str])
+        """
         try:
-            # Convert the audio file to base64
+            # Convert the audio file to base64 for the inline_data block
             audio_bytes = audio_file.read()
             audio_b64 = base64.b64encode(audio_bytes).decode()
-            
-            # Use the newer Gemini 1.5 Pro model
+
             model = genai.GenerativeModel('gemini-1.5-pro')
-            
-            # Create content parts in the correct format
+
+            prompt = """
+            Transcribe the provided audio and return ONLY a JSON object.
+
+            If the spoken language is English, use this structure:
+            {
+              "is_english": true,
+              "transcription": "Full transcription here."
+            }
+
+            If the spoken language is NOT English, use this structure:
+            {
+              "is_english": false,
+              "original_transcription": "Transcription in the original language.",
+              "english_translation": "High-quality English translation."
+            }
+            """
+
             parts = [
-                {
-                    "inline_data": {
-                        "mime_type": "audio/wav",
-                        "data": audio_b64
-                    }
-                },
-                {
-                    "text": """Please transcribe this audio.
-                    
-                    If the audio is in English:
-                    - Provide ONLY the transcription, nothing else
-                    
-                    If the audio is NOT in English:
-                    Original: [transcription in original language]
-                    Translation: [English translation]"""
-                }
+                {"inline_data": {"mime_type": "audio/wav", "data": audio_b64}},
+                {"text": prompt},
             ]
-            
-            # Generate content with proper format
+
             response = model.generate_content(parts)
-            
-            return response.text
+
+            raw = response.text.strip()
+            # Strip optional ```json fences
+            if raw.startswith("```"):
+                lines = raw.splitlines()
+                # drop first fence line
+                lines = lines[1:]
+                # drop trailing ``` if present
+                if lines and lines[-1].strip().startswith("```"):
+                    lines = lines[:-1]
+                raw = "\n".join(lines).strip()
+
+            try:
+                data = json.loads(raw)
+                if data.get("is_english"):
+                    return data.get("transcription", ""), None
+                else:
+                    return data.get("original_transcription", ""), data.get("english_translation", "")
+            except json.JSONDecodeError as e:
+                logger.error(f"Failed to parse JSON transcription: {e}. Raw response: {raw[:200]}")
+                # Fallback: treat entire response as transcription
+                return raw, None
+
         except Exception as e:
             logger.error(f"Transcription error: {str(e)}")
-            return f"Error transcribing audio: {str(e)}"
+            return f"Error transcribing audio: {str(e)}", None
 
     async def process_audio(self, audio_file):
-        """Process audio file and return transcription."""
+        """Process audio file and return (transcription, optional translation)."""
         wav_file = await self.convert_to_wav(audio_file)
-        transcription = await self.transcribe_audio(wav_file)
-        return transcription
+        transcription, translation = await self.transcribe_audio(wav_file)
+        return transcription, translation
+
+
+class TextProcessor:
+    """Process transcribed text: clarity rewrite, grounding, and proposition extraction."""
+
+    def __init__(self):
+        # Fast / cheap text-only models
+        self.clarity_model = genai.GenerativeModel('gemini-2.5-flash')
+        self.proposition_model = genai.GenerativeModel('gemini-1.5-flash')
+
+    def _enable_google_search_tool(self):
+        """Return a tools argument enabling Google Search grounding if SDK supports it."""
+        # Only enable if the SDK version exposes GoogleSearch and Tool helpers.
+        if genai_types is None:
+            return None
+        if not hasattr(genai_types, "GoogleSearch") or not hasattr(genai_types, "Tool"):
+            return None
+
+        return [genai_types.Tool(google_search=genai_types.GoogleSearch())]
+
+    def rewrite_for_clarity(self, raw_text):
+        """Rewrite the text for clarity and flag ambiguity.
+
+        Returns (clarified_text, ambiguous_terms: list[str])
+        """
+        prompt = (
+            "Rewrite the following text for clarity while preserving meaning.\n"
+            "Surround any word or phrase you suspect was mistranscribed with ‹??›.\n"
+            "Format the text with proper paragraphs and structure for readability - break up long sentences and add line breaks between different topics or ideas.\n"
+            "After the rewrite, return a JSON object with exactly two keys: \n"
+            "  clarified_text – the rewritten text,\n"
+            "  ambiguous_terms – an array of the flagged words/phrases (may be empty).\n\n"
+            "Text:\n" + raw_text
+        )
+
+        response = self.clarity_model.generate_content(prompt)
+
+        def _extract_json(text: str):
+            """Best-effort extraction of JSON object even if wrapped in code fences."""
+            text = text.strip()
+            # Remove ```json ... ``` fences if present
+            if text.startswith("```"):
+                # Strip leading ```lang and trailing ```
+                lines = text.splitlines()
+                # drop the first line (```json or ```)
+                if lines:
+                    lines = lines[1:]
+                # remove trailing ``` if present
+                if lines and lines[-1].strip().startswith("```"):
+                    lines = lines[:-1]
+                text = "\n".join(lines).strip()
+
+            # Attempt to locate first '{' ... last '}'
+            start = text.find('{')
+            end = text.rfind('}')
+            if start != -1 and end != -1 and end > start:
+                candidate = text[start:end+1]
+                try:
+                    return json.loads(candidate)
+                except json.JSONDecodeError:
+                    pass
+            # Final attempt – direct load
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError:
+                return None
+
+        data = _extract_json(response.text)
+        if data:
+            clarified_text = str(data.get('clarified_text', '')).strip()
+            ambiguous_terms = data.get('ambiguous_terms', []) or []
+            return clarified_text, ambiguous_terms
+
+        # Fallback: treat whole output as clarified text (possible the model didn't output JSON)
+        return response.text.strip(), []
+
+    def ground_ambiguous_terms(self, clarified_text):
+        """
+        Use Google Search grounding to correct ambiguous terms and qualify proper names.
+
+        Returns (corrected_text: str, search_terms: list[str])
+        """
+
+        prompt = (
+            "Here is a passage of text. Using web search as needed, correct any words or phrases "
+            "that appear between ‹??› markers. Identify and qualify all proper-name candidates "
+            "with web search.\n\n"
+            "Return a JSON object with exactly two keys:\n"
+            "  corrected_text – the final corrected text,\n"
+            "  search_terms   – an array of the search queries you performed (may be empty).\n\n"
+            "Text:\n" + clarified_text
+        )
+
+        tools_arg = self._enable_google_search_tool()
+        response = (
+            self.clarity_model.generate_content(prompt, tools=tools_arg)
+            if tools_arg is not None
+            else self.clarity_model.generate_content(prompt)
+        )
+
+        # Lightweight helper to pull JSON from model response
+        def _extract_json(text: str):
+            text = text.strip()
+            if text.startswith("```"):
+                lines = text.splitlines()[1:]
+                if lines and lines[-1].strip().startswith("```"):
+                    lines = lines[:-1]
+                text = "\n".join(lines).strip()
+            start, end = text.find("{"), text.rfind("}")
+            if start != -1 and end != -1 and end > start:
+                fragment = text[start : end + 1]
+                try:
+                    return json.loads(fragment)
+                except json.JSONDecodeError:
+                    pass
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError:
+                return None
+
+        data = _extract_json(response.text)
+        if data:
+            corrected_text = str(data.get("corrected_text", "")).strip()
+            search_terms = data.get("search_terms", []) or []
+            return corrected_text, search_terms
+
+        # Fallback – model did not return JSON
+        return response.text.strip(), []
+
+    def extract_propositions(self, final_text):
+        """Split text into atomic propositions and return list[str]."""
+
+        prompt = (
+            "Split the following text into a JSON array named propositions, where each element\n"
+            "is an atomic fact or claim expressed in the text. Return only the JSON.\n\n"
+            "Text:\n" + final_text
+        )
+
+        response = self.proposition_model.generate_content(prompt)
+        try:
+            data = json.loads(response.text)
+            return data.get('propositions', [])
+        except json.JSONDecodeError:
+            # Fallback: split by lines
+            return [line.strip() for line in response.text.splitlines() if line.strip()]
+
+    def light_edit_sentences(self, raw_text, max_move_ratio: float = 0.3):
+        """Lightly edit text while preserving original wording.
+
+        This method allows the model to:
+          • Reorder *at most* ``max_move_ratio`` of the sentences to improve flow.
+          • Fix punctuation or straightforward grammar issues.
+          • Keep every sentence's wording otherwise unchanged.
+
+        Parameters
+        ----------
+        raw_text : str
+            The original English text (either a transcription or translation).
+        max_move_ratio : float, optional
+            Maximum fraction of sentences that may be moved. Default is ``0.3`` (30 %).
+
+        Returns
+        -------
+        str
+            The lightly edited passage as plain text.
+        """
+        prompt = (
+            "You will receive a passage of text.\n"
+            f"You may reorder up to {int(max_move_ratio * 100)}% of the sentences to improve clarity "
+            "and you may correct punctuation or obvious grammar mistakes.\n"
+            "You must NOT rephrase the wording of any sentence beyond those fixes.\n"
+            "Return ONLY the updated passage as plain text. Do not add explanations or formatting.\n\n"
+            "Text:\n" + raw_text
+        )
+        response = self.clarity_model.generate_content(prompt)
+        return response.text.strip()
 
 class TelegramBot:
     def __init__(self):
         self.transcriber = AudioTranscriber()
+        self.text_processor = TextProcessor()
         
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /start command."""
@@ -122,11 +331,62 @@ class TelegramBot:
 
             # Download and process audio
             audio_data = await self.transcriber.download_audio_file(file)
-            transcription = await self.transcriber.process_audio(audio_data)
+            transcription, translation = await self.transcriber.process_audio(audio_data)
 
-            # Send transcription
+            # Choose English text (translation if present, else transcription) for downstream NLP steps
+            text_for_processing = translation if translation else transcription
+
+            # ---- New post-processing pipeline ----
+            # Here we try to make the text clearer and easier to understand.
+            # We do this by:
+            # 1. Rewriting confusing parts of the text to be more clear
+            # 2. Finding any words or phrases that might be unclear (these go into 'ambiguous_terms')
+            # The result is: 
+            # - clarified_text: A clearer version of the original text
+            # - ambiguous_terms: A list of words/phrases that might need more explanation
+            clarified_text, ambiguous_terms = self.text_processor.rewrite_for_clarity(text_for_processing)
+
+            # Ground ambiguous terms if needed
+            if ambiguous_terms:
+                final_text, search_terms = self.text_processor.ground_ambiguous_terms(clarified_text)
+            else:
+                final_text = clarified_text
+                search_terms = []
+
+            propositions = self.text_processor.extract_propositions(final_text)
+
+            # Append the footer to the clarified text before sending
+            if final_text:
+                final_text += "\n\n- This message has been filtered/transcribed by AI while walking"
+
+            # -------- Send separate messages --------
+
+            # 1) Original transcription (raw, easy to copy)
+            await update.message.reply_text(transcription)
+
+            # 2) If a separate English translation exists, send it next
+            if translation:
+                await update.message.reply_text(translation)
+
+            # 3) Clarified / grounded English text (raw)
+            await update.message.reply_text(final_text)
+
+            # 4) Lightly edited version (original phrasing, minor fixes)
+            light_text = self.text_processor.light_edit_sentences(text_for_processing)
+            if light_text:
+                light_text += "\n\n- This message has been filtered/transcribed by AI while walking"
+                await update.message.reply_text(light_text)
+
+            # 5) JSON details (ambiguous terms + search terms + propositions)
+            json_payload = json.dumps({
+                "ambiguous_terms": ambiguous_terms,
+                "search_terms": search_terms,
+                "propositions": propositions,
+            }, ensure_ascii=False, indent=2)
+
             await update.message.reply_text(
-                f"📝 Transcription and Translation:\n\n{transcription}"
+                f"```json\n{json_payload}\n```",
+                parse_mode="Markdown"
             )
 
             # Delete processing message
