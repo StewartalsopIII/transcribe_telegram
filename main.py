@@ -257,6 +257,37 @@ class TextProcessor:
             # Fallback: split by lines
             return [line.strip() for line in response.text.splitlines() if line.strip()]
 
+    def light_edit_sentences(self, raw_text, max_move_ratio: float = 0.3):
+        """Lightly edit text while preserving original wording.
+
+        This method allows the model to:
+          • Reorder *at most* ``max_move_ratio`` of the sentences to improve flow.
+          • Fix punctuation or straightforward grammar issues.
+          • Keep every sentence's wording otherwise unchanged.
+
+        Parameters
+        ----------
+        raw_text : str
+            The original English text (either a transcription or translation).
+        max_move_ratio : float, optional
+            Maximum fraction of sentences that may be moved. Default is ``0.3`` (30 %).
+
+        Returns
+        -------
+        str
+            The lightly edited passage as plain text.
+        """
+        prompt = (
+            "You will receive a passage of text.\n"
+            f"You may reorder up to {int(max_move_ratio * 100)}% of the sentences to improve clarity "
+            "and you may correct punctuation or obvious grammar mistakes.\n"
+            "You must NOT rephrase the wording of any sentence beyond those fixes.\n"
+            "Return ONLY the updated passage as plain text. Do not add explanations or formatting.\n\n"
+            "Text:\n" + raw_text
+        )
+        response = self.clarity_model.generate_content(prompt)
+        return response.text.strip()
+
 class TelegramBot:
     def __init__(self):
         self.transcriber = AudioTranscriber()
@@ -306,6 +337,13 @@ class TelegramBot:
             text_for_processing = translation if translation else transcription
 
             # ---- New post-processing pipeline ----
+            # Here we try to make the text clearer and easier to understand.
+            # We do this by:
+            # 1. Rewriting confusing parts of the text to be more clear
+            # 2. Finding any words or phrases that might be unclear (these go into 'ambiguous_terms')
+            # The result is: 
+            # - clarified_text: A clearer version of the original text
+            # - ambiguous_terms: A list of words/phrases that might need more explanation
             clarified_text, ambiguous_terms = self.text_processor.rewrite_for_clarity(text_for_processing)
 
             # Ground ambiguous terms if needed
@@ -333,7 +371,13 @@ class TelegramBot:
             # 3) Clarified / grounded English text (raw)
             await update.message.reply_text(final_text)
 
-            # 4) JSON details (ambiguous terms + search terms + propositions)
+            # 4) Lightly edited version (original phrasing, minor fixes)
+            light_text = self.text_processor.light_edit_sentences(text_for_processing)
+            if light_text:
+                light_text += "\n\n- This message has been filtered/transcribed by AI while walking"
+                await update.message.reply_text(light_text)
+
+            # 5) JSON details (ambiguous terms + search terms + propositions)
             json_payload = json.dumps({
                 "ambiguous_terms": ambiguous_terms,
                 "search_terms": search_terms,
